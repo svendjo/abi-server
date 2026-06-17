@@ -216,3 +216,9 @@ __marimo__/
 
 # Streamlit
 .streamlit/secrets.toml
+
+# Balut Eye / abi-server
+.DS_Store
+.idea
+.python-version
+results/
