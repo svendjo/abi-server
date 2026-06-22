@@ -1,0 +1,9 @@
+# Optional: local TrOCR handwriting recognition (enable with USE_TROCR=1).
+# Heavy (~GBs) and only needed if you opt into the TrOCR path; the default
+# pipeline uses the bundled TFLite model and does NOT need these.
+# Intel macOS (x86_64) ships no PyTorch wheels past 2.2.2, and recent
+# transformers requires torch>=2.4 -- so pin BOTH to a compatible pair.
+# (On Apple Silicon / Linux you can instead use torch>=2.4 + latest transformers.)
+torch==2.2.2
+transformers==4.46.3
+sentencepiece>=0.2

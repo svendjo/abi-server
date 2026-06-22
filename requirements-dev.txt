@@ -5,3 +5,4 @@ pillow==11.1.0
 python-multipart==0.0.20
 tensorflow==2.16.2
 uvicorn==0.34.0
+watchfiles==0.24.0  # enables RELOAD=1 auto-restart on code changes (dev only)

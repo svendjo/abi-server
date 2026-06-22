@@ -34,6 +34,24 @@ constrained. `scorecard.py` encodes those rules and `read_sheet` applies them:
 
 The returned grid therefore mixes the printed labels (strings) with the corrected numbers.
 
+## Recognizers
+Two interchangeable ways to read a cell; both feed the same `scorecard.py` schema layer:
+
+- **Bundled CNN (default).** The small TFLite digit/strike model from `abi-models`, with
+  per-character segmentation and probability-constrained decoding. No extra deps.
+- **TrOCR (optional, local).** `microsoft/trocr-base-handwritten` reads a whole cell crop in
+  one shot — no segmentation — which is more robust on real photos. Enable it with:
+
+  ```
+  pip install -r requirements-trocr.txt   # heavy: torch + transformers (~GBs)
+  USE_TROCR=1 python server.py            # model (~1.3 GB) downloads on first run
+  ```
+
+  Blank cells are caught by an ink-fraction check; the rest are batch-read by TrOCR, parsed to
+  digits, and snapped to each cell's legal set. If the deps aren't installed the server logs a
+  warning and falls back to the CNN. (TrOCR is trained on English handwriting lines, not isolated
+  digits, and is slow on CPU — batched but still ~seconds per sheet; a GPU helps a lot.)
+
 ## Local
 Create a virtual environment.
 
