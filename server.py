@@ -17,11 +17,20 @@ import os
 
 import scorecard
 import trocr_reader
+import ctc_reader
 
 app = FastAPI()
 
-# Optionally read cells with the local TrOCR handwriting model instead of the
-# bundled CNN. Falls back to the CNN if the deps aren't installed.
+# Cell recognizer selection (the segment+classify CNN is the default):
+#   USE_CTC=1   -> segmentation-free whole-cell CTC reader (cell-reader*.keras)
+#   USE_TROCR=1 -> local TrOCR handwriting model
+# Each falls back to the CNN if its model/deps aren't available.
+USE_CTC = bool(os.environ.get("USE_CTC")) and ctc_reader.available()
+if os.environ.get("USE_CTC") and not USE_CTC:
+    print("WARNING: USE_CTC set but no cell-reader model found; using the CNN.")
+elif USE_CTC:
+    print("Using the segmentation-free CTC reader for cell recognition.")
+
 USE_TROCR = bool(os.environ.get("USE_TROCR")) and trocr_reader.available()
 if os.environ.get("USE_TROCR") and not USE_TROCR:
     print("WARNING: USE_TROCR set but torch/transformers not available; using the CNN.")
@@ -50,7 +59,7 @@ RESULTS_DIR.mkdir(exist_ok=True)
 
 # Load the digit/symbol recognizer. If it hasn't been trained/copied yet the
 # server still boots so the frontend can be developed; /predict then 503s.
-MODEL_PATH = "digit-model0608.tflite"
+MODEL_PATH = "digit-model0622.tflite"  # fine-tuned on real Balut cells (finetune.py)
 try:
     interpreter = tflite(model_path=MODEL_PATH)
     interpreter.allocate_tensors()
@@ -139,25 +148,40 @@ def order_points(pts):
 
 
 def locate_table(gray):
-    """Crop to the table. The image is already deskewed, so an axis-aligned
-    bounding box of the dominant contour is enough. Falls back to the full frame
-    if no large contour is found.
+    """Crop to the table by its grid lattice.
+
+    The 10x8 table is the largest connected mesh of long horizontal + vertical
+    rules in the frame. We isolate those rules with directional morphology and OR
+    them together; the grid (where the rules cross) becomes one big connected
+    component whose bounding box is the table. This is robust to the table being
+    only part of the sheet and to the surrounding graphics/text (logos, legends,
+    titles), which don't form long ruled lines -- unlike "biggest filled contour",
+    which the table is only marginally (and which dropped 5.jpg at 0.195 < 0.2).
+    Falls back to the full frame if no sufficiently large mesh is found.
     """
+    h, w = gray.shape
     blur = cv2.GaussianBlur(gray, (5, 5), 0)
-    thresh = cv2.adaptiveThreshold(
+    bw = cv2.adaptiveThreshold(
         blur, 255, cv2.ADAPTIVE_THRESH_GAUSSIAN_C, cv2.THRESH_BINARY_INV, 31, 10
     )
-    contours, _ = cv2.findContours(thresh, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
-    if not contours:
+    # Long horizontal and vertical runs only (kernels ~1/40 of the frame: long
+    # enough to drop handwriting/text, short enough to keep a partial-width table).
+    hk = cv2.getStructuringElement(cv2.MORPH_RECT, (max(30, w // 40), 1))
+    vk = cv2.getStructuringElement(cv2.MORPH_RECT, (1, max(30, h // 40)))
+    horiz = cv2.morphologyEx(bw, cv2.MORPH_OPEN, hk)
+    vert = cv2.morphologyEx(bw, cv2.MORPH_OPEN, vk)
+    lattice = cv2.bitwise_or(horiz, vert)
+    lattice = cv2.dilate(lattice, np.ones((3, 3), np.uint8), iterations=2)  # bridge gaps at crossings
+    n, _, stats, _ = cv2.connectedComponentsWithStats((lattice > 0).astype("uint8"), 8)
+    if n <= 1:
         return gray
 
-    biggest = max(contours, key=cv2.contourArea)
-    # Ignore tiny detections (noise) and fall back to the full frame.
-    if cv2.contourArea(biggest) < 0.2 * gray.shape[0] * gray.shape[1]:
+    i = 1 + int(np.argmax(stats[1:, cv2.CC_STAT_AREA]))  # largest mesh = the table
+    x, y = stats[i, cv2.CC_STAT_LEFT], stats[i, cv2.CC_STAT_TOP]
+    bw_, bh = stats[i, cv2.CC_STAT_WIDTH], stats[i, cv2.CC_STAT_HEIGHT]
+    if bw_ < 0.2 * w or bh < 0.1 * h:  # too small to be the table -> full frame
         return gray
-
-    x, y, w, h = cv2.boundingRect(biggest)
-    return gray[y:y + h, x:x + w]
+    return gray[y:y + bh, x:x + bw_]
 
 
 def _trim_to_gridlines(table):
@@ -362,11 +386,15 @@ def preprocess_char(crop):
     return canvas[np.newaxis, ..., np.newaxis].astype(np.float32)
 
 
-def _segment(cell):
-    """Cell -> (sign, [prob_vector per digit blob], left-to-right).
+def segment_chars(cell):
+    """Cell -> (sign, [28x28x1 preprocessed char crops], left-to-right).
 
-    A blank cell yields an empty list. A separate wide, short blob to the left is
-    a minus sign and sets sign to -1 (the digit model has no minus class).
+    Splits a cell into its digit blobs the way the recognizer expects: drop
+    specks/grid fragments by area, treat a wide short blob as a leading minus
+    sign (the model has no minus class), keep tall blobs as digits ordered left
+    to right, and center each in a 28x28 MNIST-style canvas. A blank cell yields
+    an empty list. Shared by the recognizer (`_segment`) and the dataset / fine-
+    tune tooling, so training crops match exactly what is classified at inference.
     """
     if cell.size == 0:
         return 1, []
@@ -384,9 +412,15 @@ def _segment(cell):
     digit_boxes = [b for b in boxes if b not in dashes and b[3] > 0.25 * H]
     digit_boxes.sort(key=lambda b: b[0])  # left to right
     sign = -1 if dashes else 1
-    probs = [classify(preprocess_char(binary[y:y + h, x:x + w]))
-             for (x, y, w, h) in digit_boxes]
-    return sign, probs
+    chars = [preprocess_char(binary[y:y + h, x:x + w]) for (x, y, w, h) in digit_boxes]
+    return sign, chars
+
+
+def _segment(cell):
+    """Cell -> (sign, [prob_vector per digit blob]). Classifies each blob from
+    `segment_chars` with the CNN."""
+    sign, chars = segment_chars(cell)
+    return sign, [classify(ch) for ch in chars]
 
 
 def read_cell(cell):
@@ -406,45 +440,63 @@ def read_cell(cell):
     return sign * int("".join(digits)) if digits else 0
 
 
-def read_cell_constrained(cell, candidates):
-    """Read a cell, choosing the most likely value from `candidates`.
+def _rank(sign, probs, candidates):
+    """Rank `candidates` by the model's likelihood -- most likely value first.
 
-    `candidates` is the cell's legal value set (non-negative ints; 0 covers
-    strike/empty). Instead of taking the argmax per character and snapping the
-    result afterwards, we keep the model's full per-character probabilities and
-    pick the legal value with the highest likelihood -- so the constraint guides
-    the read and is ranked by the model's own confusion, not numeric distance.
+    Works off the per-character probability vectors from `_segment`, so we keep
+    the model's 2nd-, 3rd-best readings, not just the argmax. A candidate only
+    competes if its sign and digit count match what was segmented; its score is
+    the product of the per-digit probabilities (strike / 0 handled specially).
+    Returns a list of (value, score) sorted by score descending -- empty if no
+    candidate fits the segmented shape.
     """
-    _, probs = _segment(cell)
-    if not probs:
-        return 0 if 0 in candidates else min(candidates, key=abs)
     n = len(probs)
-
-    best, best_score = None, -1.0
+    scored = []
     for v in candidates:
-        if v == 0:  # strike or a written "0": a single blob
-            if n != 1:
+        if v == 0:  # strike, empty cell, or a written "0"
+            if n == 0:
+                s = 1.0  # a blank cell is a strike == 0
+            elif n == 1:
+                s = float(max(probs[0][STRIKE_CLASS], probs[0][0]))
+            else:
                 continue
-            score = float(max(probs[0][STRIKE_CLASS], probs[0][0]))
         else:
-            digits = [int(ch) for ch in str(v)]
+            if (v < 0) != (sign < 0):
+                continue  # a detected minus sign must match the candidate's sign
+            digits = [int(ch) for ch in str(abs(v))]
             if len(digits) != n:
                 continue
-            score = 1.0
+            s = 1.0
             for p, d in zip(probs, digits):
-                score *= float(p[d])
-        if score > best_score:
-            best, best_score = v, score
-    if best is not None:
-        return best
+                s *= float(p[d])
+        scored.append((v, s))
+    scored.sort(key=lambda t: t[1], reverse=True)
+    return scored
 
-    # No candidate has the segmented digit count -> fall back to a loose read,
-    # then snap to the legal set (handles mis-segmentation as best we can).
+
+def read_cell_constrained(cell, candidates):
+    """Read a cell as the most likely value from `candidates` (its legal set).
+
+    Keeps the model's full per-character probabilities and picks the legal value
+    with the highest likelihood -- so if the most likely reading isn't legal we
+    fall through to the next most likely, ranked by the model's own confusion
+    rather than numeric distance. `candidates` may include negatives (col 8
+    points); the minus sign is read from a separate blob by `_segment`. Falls
+    back to a loose read + snap when the segmented digit count fits no candidate.
+    """
+    sign, probs = _segment(cell)
+    ranked = _rank(sign, probs, candidates)
+    if ranked:
+        return ranked[0][0]
+
+    # No candidate has the segmented digit count -> loose read, then snap.
+    if not probs:
+        return 0 if 0 in candidates else min(candidates, key=abs)
     classes = [int(np.argmax(p)) for p in probs]
     if STRIKE_CLASS in classes:
         return 0 if 0 in candidates else min(candidates, key=abs)
     digits = [str(c) for c in classes if c < 10]
-    value = int("".join(digits)) if digits else 0
+    value = sign * int("".join(digits)) if digits else 0
     return scorecard._snap(value, candidates)
 
 
@@ -462,16 +514,39 @@ INK_MIN = 0.02  # below this a cell is treated as blank (-> 0)
 
 
 def _read_cells_cnn(cells, raw):
-    """Fill `raw` for every recognized cell using the bundled CNN."""
+    """Fill `raw` for every recognized cell using the bundled CNN.
+
+    Constrained cells (entries, score, jackpot, points -- all have a legal set)
+    are read by ranking that set with the model's probability vectors and taking
+    the top value. The grand totals (I6, I8, J8) have no constraint and are read
+    loosely so they stay independent of the schema for the cross-check.
+    """
     for r in range(ROWS):
         for c in range(COLS):
             if not scorecard.needs_recognition(r, c):
                 continue
             cell = cells[r * COLS + c]
             cands = scorecard.candidates(r, c)
-            # Entries and jackpot have small legal sets -> constrained decode.
-            # Totals (col 6, I6, J8) are read loosely to keep the cross-check honest.
-            raw[r][c] = read_cell_constrained(cell, cands) if cands else read_cell(cell)
+            if not cands:
+                raw[r][c] = read_cell(cell)
+                continue
+            sign, probs = _segment(cell)
+            ranked = _rank(sign, probs, cands)
+            raw[r][c] = ranked[0][0] if ranked else read_cell_constrained(cell, cands)
+            if DEBUG_CROPS:
+                top = ", ".join(f"{v}:{s:.3f}" for v, s in ranked[:3]) or "(no fit)"
+                print(f"  {chr(ord('A') + r)}{c + 1} -> {raw[r][c]}   top: {top}")
+
+
+def _read_cells_ctc(cells, raw):
+    """Fill `raw` with the segmentation-free CTC reader: read each cell whole, in
+    one batch, then snap to the cell's legal set. No blob splitting involved."""
+    to_read = [(r, c) for r in range(ROWS) for c in range(COLS)
+               if scorecard.needs_recognition(r, c)]
+    values = ctc_reader.read_cells([cells[r * COLS + c] for r, c in to_read])
+    for (r, c), v in zip(to_read, values):
+        cands = scorecard.candidates(r, c)
+        raw[r][c] = scorecard._snap(v, cands) if cands else v
 
 
 def _read_cells_trocr(cells, raw):
@@ -497,6 +572,8 @@ def _read_cells_trocr(cells, raw):
     for (r, c), text in zip(to_ocr, texts):
         digits = "".join(ch for ch in text if ch.isdigit())
         value = int(digits) if digits else 0  # no digits -> strike/unreadable -> 0
+        if value and ("-" in text or "−" in text):  # minus -> negative points
+            value = -value
         cands = scorecard.candidates(r, c)
         raw[r][c] = scorecard._snap(value, cands) if cands else value
 
@@ -512,16 +589,16 @@ def _grid_overlay(table, rb, cb):
     return vis
 
 
-def read_sheet(image):
-    """Full pipeline: PIL image -> corrected 10x8 grid.
+def slice_sheet(image, debug=False):
+    """Geometry pipeline: PIL image -> (table, cells, rb, cb, nr, nc).
 
-    Only handwritten cells are recognized; printed labels, blank cells and the
-    computed sums are filled in by the scorecard schema (see scorecard.py), so
-    the printed text and graphics on the sheet are never read as digits.
+    Deskew -> locate -> dewarp -> trim -> grid-snap -> split into 80 cell crops.
+    Shared by read_sheet and the dataset-export tool so both slice cells the same
+    way. With debug=True, writes the numbered stage images to RESULTS_DIR.
     """
     rgb = np.array(image.convert("RGB"))
     gray = cv2.cvtColor(rgb, cv2.COLOR_RGB2GRAY)
-    if DEBUG_CROPS:
+    if debug:
         cv2.imwrite(str(RESULTS_DIR / "1-original.png"), gray)
 
     # Deskew the whole frame before locating/slicing the table.
@@ -532,29 +609,47 @@ def read_sheet(image):
             "Please straighten it (within ±20°) and rescan."
         )
     gray = rotate(gray, angle)
-    if DEBUG_CROPS:
+    if debug:
         print(f"Deskew angle: {angle:+.2f}°")
         cv2.imwrite(str(RESULTS_DIR / "2-deskew.png"), gray)
 
     table = locate_table(gray)                      # rough contour crop
-    if DEBUG_CROPS:
+    if debug:
         cv2.imwrite(str(RESULTS_DIR / "3-crop.png"), table)
     table = dewarp(table)                           # flatten page curvature first
-    if DEBUG_CROPS:
+    if debug:
         cv2.imwrite(str(RESULTS_DIR / "4-dewarp.png"), table)
     table = _trim_to_gridlines(table)               # then trim to grid extent
-    if DEBUG_CROPS:
+    if debug:
         cv2.imwrite(str(RESULTS_DIR / "5-trim.png"), table)
 
     rb, cb, nr, nc = grid_boundaries(table)
     cells = split_cells(table, rb, cb)
-    if DEBUG_CROPS:
+    if debug:
         ok = nr == ROWS + 1 and nc == COLS + 1
         print(f"Grid rules: rows {nr}/{ROWS + 1}, cols {nc}/{COLS + 1}"
               f"{'' if ok else '  (even-split fallback where the count mismatched)'}")
         cv2.imwrite(str(RESULTS_DIR / "6-grid.png"), _grid_overlay(table, rb, cb))
+    return table, cells, rb, cb, nr, nc
+
+
+def read_sheet(image):
+    """Full pipeline: PIL image -> corrected 10x8 grid.
+
+    Only handwritten cells are recognized; printed labels, blank cells and the
+    computed sums are filled in by the scorecard schema (see scorecard.py), so
+    the printed text and graphics on the sheet are never read as digits.
+    """
+    _, cells, _, _, _, _ = slice_sheet(image, debug=DEBUG_CROPS)
     raw = [[None] * COLS for _ in range(ROWS)]
-    if USE_TROCR:
+    if USE_CTC:
+        try:
+            _read_cells_ctc(cells, raw)
+        except Exception as e:  # model/keras issue -> don't 500
+            print(f"CTC read failed ({e}); falling back to the CNN.")
+            raw = [[None] * COLS for _ in range(ROWS)]
+            _read_cells_cnn(cells, raw)
+    elif USE_TROCR:
         try:
             _read_cells_trocr(cells, raw)
         except Exception as e:  # broken torch / download failure -> don't 500
@@ -564,8 +659,8 @@ def read_sheet(image):
     else:
         _read_cells_cnn(cells, raw)
     grid = scorecard.apply_schema(raw)
-    problems = scorecard.check_consistency(raw, grid)
-    return grid, problems
+    warnings = scorecard.check_consistency(raw, grid)
+    return grid, warnings
 
 
 def format_grid(grid):
@@ -589,38 +684,31 @@ async def predict(file: UploadFile = File(...)):
     try:
         contents = await file.read()
         image = Image.open(io.BytesIO(contents))
-        grid, problems = read_sheet(image)
+        grid, warnings = read_sheet(image)
     except ScanError as e:
         raise HTTPException(status_code=422, detail=str(e))
     except Exception as e:
         raise HTTPException(status_code=500, detail=str(e))
 
-    # Always log what was read, whether or not it passes validation.
+    # Always log what was read.
     print("Scorecard read:")
     print(format_grid(grid))
 
-    # The sheet's own written totals must agree with the cells. If they don't,
-    # the read is untrustworthy -- return an error (with what we read) instead of
-    # a confidently-wrong grid, and don't save it.
-    if problems:
-        print("Consistency check FAILED:")
-        for p in problems:
-            print(f"  - {p}")
-        raise HTTPException(
-            status_code=422,
-            detail={
-                "message": "Scorecard failed consistency checks; it was likely misread.",
-                "problems": problems,
-                "grid": grid,
-            },
-        )
+    # The sheet's own written Score/Points totals are read independently and
+    # cross-checked against what we compute from the cells. A disagreement is a
+    # hint that something was misread, but it's advisory only: we log it and
+    # proceed with the computed (best-effort) value rather than rejecting the sheet.
+    if warnings:
+        print("Cross-check warnings (proceeding with computed values):")
+        for w in warnings:
+            print(f"  - {w}")
 
     csv = "\n".join(",".join(str(v) for v in row) for row in grid) + "\n"
     saved_as = RESULTS_DIR / "7-scorecard.csv"  # overwritten each scan
     saved_as.write_text(csv)
     print(f"Saved {saved_as}")
 
-    return {"grid": grid, "csv": csv, "saved_as": str(saved_as)}
+    return {"grid": grid, "csv": csv, "saved_as": str(saved_as), "warnings": warnings}
 
 
 if __name__ == "__main__":

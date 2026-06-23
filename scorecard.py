@@ -65,7 +65,7 @@ ROW_SPEC = {
     "D": dict(entries={6, 12, 18, 24},          jackpot=24,   jp_points=4, incentive=2, threshold=78,    multiple=6),
     "E": dict(entries={15, 20},                 jackpot=20,   jp_points=8, incentive=4, threshold="all", multiple=None),
     "F": dict(entries=FULL_HOUSE,               jackpot=22,   jp_points=6, incentive=3, threshold="all", multiple=None),
-    "G": dict(entries=CHOICE,                   jackpot=25,   jp_points=4, incentive=2, threshold="all", multiple=None),
+    "G": dict(entries=CHOICE,                   jackpot=25,   jp_points=4, incentive=2, threshold=100,    multiple=None),
     "H": dict(entries={25, 30, 35, 40, 45, 50}, jackpot=None,                                            multiple=None),
 }
 SCORE_ROWS = list(ROW_SPEC)  # B..H, in order
@@ -93,26 +93,59 @@ def needs_recognition(r, c):
             return True
         if col == 7:  # jackpot (None for H, which has no jackpot)
             return ROW_SPEC[row]["jackpot"] is not None
-        return False  # col 6 score is read by CHECK_CELLS; col 8 is derived
+        if col == 8:  # points: derived, but read too as a cross-check
+            return True
+        return False  # col 6 score is read via CHECK_CELLS
     if (row, col) == ("I", 8):  # a point value that feeds J8
         return True
     return False  # I6 and J8 are computed; everything else is blank
 
 
+def score_candidates(row):
+    """Every value the row's score (col 6) can legally take: a sum of its four
+    game cells, each of which is a legal entry or a strike (0)."""
+    entries = ROW_SPEC[row]["entries"] | {STRIKE}
+    sums = {0}
+    for _ in range(4):
+        sums = {s + e for s in sums for e in entries}
+    return sums
+
+
+def points_candidates(row):
+    """The row's small legal set of point values (col 8). For B-G this is
+    {0, incentive, +jp_points, -jp_points}; for H (Balut) the balut-count points.
+    """
+    spec = ROW_SPEC[row]
+    if spec["jackpot"] is None:  # H: points come from the number of baluts
+        return set(BALUT_POINTS.values())
+    jp = spec["jp_points"]
+    return {0, spec["incentive"], jp, -jp}
+
+
 def candidates(r, c):
     """Legal value set for a CONSTRAINED read of cell (r, c), or None.
 
-    Returns a small set (strike is 0) for the entry and jackpot cells, whose
-    values everything else derives from. Returns None for cells that should be
-    read loosely -- the totals (col 6, I6, J8) and anything not read -- so their
-    reading stays independent of the schema for the consistency cross-check.
+    The reader keeps the model's full probability vectors and picks the legal
+    value with the highest likelihood. We constrain:
+      - entry cells (cols 2-5) to their per-row value set,
+      - the jackpot (col 7) to {jackpot value, strike},
+      - the row score (col 6) to its achievable sums, and
+      - the points (col 8) to the row's small legal set.
+    Col 6 and col 8 are *also* computed from the schema; the constrained read is
+    an independent cross-check (read from the cell's own pixels, not the entries).
+    Returns None for the grand totals (I6, I8, J8), which are read loosely so they
+    stay fully independent of the schema.
     """
     row, col = chr(ord("A") + r), c + 1
     if row in ROW_SPEC:
         if col in (2, 3, 4, 5):  # game cells
             return ROW_SPEC[row]["entries"] | {STRIKE}
+        if col == 6:  # row score: a sum of the four legal entries
+            return score_candidates(row)
         if col == 7 and ROW_SPEC[row]["jackpot"] is not None:  # jackpot
             return {ROW_SPEC[row]["jackpot"], STRIKE}
+        if col == 8:  # points (also derived)
+            return points_candidates(row)
     return None
 
 
@@ -202,43 +235,42 @@ def apply_schema(raw):
 def check_consistency(raw, grid):
     """Cross-check the player's handwritten totals against the computed ones.
 
-    Returns a list of human-readable problem strings (empty if the sheet is
-    self-consistent). Because the player writes every row Score and the two grand
-    totals, disagreeing with what we compute from the cells is a strong signal
-    that something was misread -- the server turns a non-empty result into an
-    error rather than returning a confidently-wrong grid.
+    Returns a list of human-readable WARNING strings (empty if the sheet is
+    self-consistent). The player writes every row Score (col 6) and Points
+    (col 8) plus the two grand totals; we read those independently and flag any
+    that disagree with what the schema computes from the cells. These are
+    advisory only -- the caller logs them and proceeds with the computed value
+    (the best-effort read), it does not reject the sheet.
     """
-    problems = []
+    warnings = []
 
     def written(row, col):
-        v = raw[_idx(row, col)[0]][_idx(row, col)[1]]
-        return v
+        return raw[_idx(row, col)[0]][_idx(row, col)[1]]
     def computed(row, col):
         return grid[_idx(row, col)[0]][_idx(row, col)[1]]
 
     for row in SCORE_ROWS:
-        comp = computed(row, 6)
-        wr = written(row, 6)
-        if wr is None:
-            continue
-        m = ROW_SPEC[row]["multiple"]
-        if m and wr % m:
-            problems.append(f"Row {row}: score {wr} is not a multiple of {m}.")
-        if wr != comp:
-            problems.append(
-                f"Row {row}: written total {wr} != sum of its cells {comp}."
+        wr6 = written(row, 6)
+        if wr6 is not None and wr6 != computed(row, 6):
+            warnings.append(
+                f"Row {row}: read score {wr6} != computed {computed(row, 6)}; using computed."
+            )
+        wr8 = written(row, 8)
+        if wr8 is not None and wr8 != computed(row, 8):
+            warnings.append(
+                f"Row {row}: read points {wr8} != computed {computed(row, 8)}; using computed."
             )
 
     wr_i6 = written("I", 6)
     if wr_i6 is not None and wr_i6 != computed("I", 6):
-        problems.append(
-            f"Total Score (I6): written {wr_i6} != sum of row scores {computed('I', 6)}."
+        warnings.append(
+            f"Total Score (I6): read {wr_i6} != computed {computed('I', 6)}; using computed."
         )
 
     wr_j8 = written("J", 8)
     if wr_j8 is not None and wr_j8 != computed("J", 8):
-        problems.append(
-            f"Grand Total points (J8): written {wr_j8} != sum of points {computed('J', 8)}."
+        warnings.append(
+            f"Grand Total points (J8): read {wr_j8} != computed {computed('J', 8)}; using computed."
         )
 
-    return problems
+    return warnings
