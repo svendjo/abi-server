@@ -1,5 +1,7 @@
-from fastapi import FastAPI, File, UploadFile, HTTPException
+from fastapi import FastAPI, File, UploadFile, HTTPException, Form
 from fastapi.middleware.cors import CORSMiddleware
+from datetime import datetime
+import json
 try:
     from tflite_runtime.interpreter import Interpreter as tflite
 except ImportError:
@@ -709,6 +711,30 @@ async def predict(file: UploadFile = File(...)):
     print(f"Saved {saved_as}")
 
     return {"grid": grid, "csv": csv, "saved_as": str(saved_as), "warnings": warnings}
+
+
+@app.post("/feedback")
+async def feedback(file: UploadFile = File(...), grid: str = Form(...)):
+    """Store a user-corrected scorecard as ground truth.
+
+    The frontend sends the original image plus the player-corrected 10x8 grid
+    (JSON). We save both under results/feedback/<timestamp>/ so they can later be
+    folded into the training set (the corrected grid is the label for the image).
+    """
+    try:
+        rows = json.loads(grid)
+    except (ValueError, TypeError):
+        raise HTTPException(status_code=400, detail="`grid` must be a JSON array.")
+
+    out = RESULTS_DIR / "feedback" / datetime.now().strftime("%Y%m%d-%H%M%S-%f")
+    out.mkdir(parents=True, exist_ok=True)
+    (out / "image.jpg").write_bytes(await file.read())
+    csv = "\n".join(
+        ",".join("" if v is None else str(v) for v in row) for row in rows
+    ) + "\n"
+    (out / "grid.csv").write_text(csv)
+    print(f"Saved corrected scorecard (ground truth) to {out}")
+    return {"ok": True, "saved_as": str(out)}
 
 
 if __name__ == "__main__":
