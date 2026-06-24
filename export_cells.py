@@ -59,18 +59,23 @@ def load_truth(path):
     return grid
 
 
+# A strike (or empty cell, or the "-" no-jackpot marker) -> value 0. The canonical
+# strike glyph in our CSVs is "x", but accept the other strike marks too. A written
+# "0" is NOT a strike here -- it's a genuine 0 (e.g. a row score of 0).
+STRIKE_TEXT = {"", "-", "x", "X", "/", "\\"}
+
+
 def truth_value(text):
     """Map a ground-truth cell string to (value:int, is_blank:bool).
 
-    A blank cell is a strike/empty == 0. A printed placeholder like '-' (the
-    Balut jackpot) is also treated as blank. Otherwise parse the integer.
+    Strike / empty cells -> (0, True); anything else is parsed as an integer.
     """
-    if text in ("", "-"):
+    if text in STRIKE_TEXT:
         return 0, True
     try:
         return int(text), False
     except ValueError:
-        # Non-numeric (shouldn't happen for value cells) -> skip by signalling None.
+        # Non-numeric and not a known strike mark -> skip by signalling None.
         return None, False
 
 

@@ -4,12 +4,18 @@ Web service for Balut Eye.
 Takes an uploaded photo of a 10×8 table of handwritten numbers, locates the table
 with OpenCV, slices it into 80 cells, recognizes each cell with the TFLite model
 from `abi-models`, and returns the result as a 10×8 grid. A copy of every result
-is saved server-side as a CSV under `results/`.
+is saved server-side: each read gets its own `results/<id>/` folder (`id` = `YYYYMMDD-xxxxxx`)
+holding the input image, debug stages, and `7-scorecard.csv`.
 
-`POST /predict` (multipart `file`) →
-`{ "grid": [[..8..], …10 rows], "csv": "<10 lines>", "saved_as": "results/result-<ts>.csv" }`
+`POST /read` (multipart `file`) →
+`{ "id": "<YYYYMMDD-xxxxxx>", "grid": [[..8..], …10 rows], "editable": [[..booleans..]], "csv": "<10 lines>", "saved_as": "results/<id>" }`
+where `editable[r][c]` flags the handwritten cells. Related endpoints: `POST /accept` and
+`POST /decline` write `verdict.md` (`accepted`/`declined`); `POST /feedback` (id + corrected grid)
+writes `8-feedback.csv` in the read's folder, as ground truth.
 
-A cell containing `/`, `\`, or `x` is read as `0`.
+A **strike** — written as any of `0 / - \ x X` — scores `0`, and is only valid in the game cells
+(cols 2–5) and the jackpot (col 7). In the returned grid (and the CSV / Excel / UI) a strike is
+shown as `x`.
 
 ## Scorecard schema
 The sheet is not just any 10×8 grid — it is the IBF Balut card, and most cells are
@@ -17,20 +23,26 @@ constrained. `scorecard.py` encodes those rules and `read_sheet` applies them:
 
 - **Printed text and graphics are ignored.** Column 1 (`4's`, `5's`, `Straight`, …) and the
   row-A headers (`Score`, `Jackpot`, `Points`) are not handwritten, so they are never
-  digit-recognized — the schema fills them in. Always-empty cells (`H7`, `I7`, `A1`–`A5`) are
-  left blank.
+  digit-recognized — the schema fills them in. `A1`–`A5` are left blank, and the no-jackpot
+  markers `H7`/`I7` show `-`.
 - **Handwritten cells are constrained to their legal set.** e.g. a `4's` game cell must be one of
   `{4, 8, 12, 16, 20, strike}`, a jackpot must be `16` or a strike. Rather than read a cell
   freely and snap afterwards, `read_cell_constrained` keeps the model's full per-character
   probabilities and picks the legal value with the highest likelihood (so `"76"` → `16`, not the
   numerically-nearest `20`). Points cells aren't read at all — they're derived (see below).
-- **Sums are computed, not read.** Each row's Score (col 6) is the sum of its four game cells,
-  `I6` is the grand total of scores, and `J8` is the grand total of points.
+- **Sums and totals are computed, not read.** Each row's Score (col 6) is the sum of its four game
+  cells; `I6` is the grand total of scores; `I8` (the Total-Score points) is **derived from `I6` by
+  bracket** (below 250 and 250–299 → −2, rising to 650+ → 6); and `J8` is the grand total of points
+  (`B8…I8`).
 - **Points (col 8) are derived.** B–G from the jackpot/incentive rules, H (Balut) from the number
-  of baluts scored. Negative values come from the rules, not from reading a minus sign.
-- **The written totals are cross-checked.** Each row Score and the two grand totals are *also* read
-  (loosely, to stay independent) and compared to the computed values; a mismatch makes `/predict`
-  return `422` instead of a likely-wrong grid.
+  of baluts scored. Negative values come from the rules, not from reading a minus sign. The
+  incentive condition that sets the sign is a per-row threshold on the row score — 4's ≥ 52,
+  5's ≥ 65, 6's ≥ 78, and **Choice (G6) ≥ 100** — except Straight and Full House, which instead
+  require all four game cells to be non-struck.
+- **The written totals are cross-checked.** Each row Score / Points and the two grand totals are
+  *also* read independently and compared to the computed values; a mismatch is logged as an advisory
+  **warning** (returned in the response) — the server proceeds with the computed value rather than
+  rejecting the sheet.
 
 The returned grid therefore mixes the printed labels (strings) with the corrected numbers.
 
@@ -77,7 +89,7 @@ Run the server.
 
 Test it.
 
-`curl -X POST http://localhost:8080/predict \
+`curl -X POST http://localhost:8080/read \
   -H "Content-Type: multipart/form-data" \
   -F "file=@/path/to/sheet.jpg"`
 

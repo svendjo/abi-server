@@ -8,12 +8,16 @@ directly. The remaining (handwritten) cells are each constrained to a small set
 of legal values, which we use to correct the raw model output, and several cells
 are sums of others, which we compute rather than read.
 
-A `strike` (a printed /, \\ or x) scores 0, so it is represented here as the
-value 0. Point cells (column 8) may be negative.
+A `strike` scores 0. When reading, a strike may be written as `0`, `/`, `-`, `\\`,
+`x`, or `X`. Internally a strike is the value 0 (so it sums correctly), but in the
+OUTPUT grid (and thus the CSV / Excel / UI) a struck cell is shown as the
+character `"x"`. Strikes are only possible in the game cells (cols 2-5) and the
+jackpot (col 7). Point cells (column 8) may be negative.
 """
 
 ROWS, COLS = 10, 8
-STRIKE = 0  # a struck cell (/, \, x) -> value 0
+STRIKE = 0            # a struck cell internally scores 0 ...
+STRIKE_DISPLAY = "x"  # ... but is shown as "x" in the output grid / CSV / UI
 
 
 def _idx(row, col):
@@ -96,9 +100,19 @@ def needs_recognition(r, c):
         if col == 8:  # points: derived, but read too as a cross-check
             return True
         return False  # col 6 score is read via CHECK_CELLS
-    if (row, col) == ("I", 8):  # a point value that feeds J8
+    return False  # I6/I8/J8 are computed; everything else is blank or printed
+
+
+def is_editable(r, c):
+    """Whether the correction UI lets this (0-based) cell be edited.
+
+    The player's handwritten cells -- i.e. everything `needs_recognition` reads,
+    PLUS I8 (the Total-Score points), which we derive from I6 rather than read but
+    which is still handwritten on the card, so it can be corrected for ground truth.
+    """
+    if needs_recognition(r, c):
         return True
-    return False  # I6 and J8 are computed; everything else is blank
+    return (chr(ord("A") + r), c + 1) == ("I", 8)
 
 
 def score_candidates(row):
@@ -120,6 +134,21 @@ def points_candidates(row):
         return set(BALUT_POINTS.values())
     jp = spec["jp_points"]
     return {0, spec["incentive"], jp, -jp}
+
+
+# Row I "Total Score": I8 points are derived from the I6 grand-total score by
+# bracket. Below 250 scores -2; 650 and up scores 6.
+TOTAL_SCORE_BRACKETS = [
+    (300, -2), (350, -1), (400, 0), (450, 1), (500, 2), (550, 3), (600, 4), (650, 5),
+]
+
+
+def total_score_points(i6):
+    """I8: points awarded for the total score I6 (= sum of B6-H6)."""
+    for upper, pts in TOTAL_SCORE_BRACKETS:
+        if i6 < upper:
+            return pts
+    return 6
 
 
 def candidates(r, c):
@@ -197,8 +226,8 @@ def apply_schema(raw):
         entries = []
         for col in (2, 3, 4, 5):
             v = _snap(raw[r][col - 1] or 0, spec["entries"] | {STRIKE})
-            entries.append(v)
-            out[r][col - 1] = v
+            entries.append(v)  # numeric (0 for a strike) so the score sums right
+            out[r][col - 1] = STRIKE_DISPLAY if v == STRIKE else v
 
         score = sum(entries)
         out[r][5] = score  # col 6 = row score
@@ -209,20 +238,20 @@ def apply_schema(raw):
             out[r][7] = BALUT_POINTS[baluts]  # col 8
             continue
 
-        # Col 7 is the jackpot: its achievement value, or struck/empty (== 0).
+        # Col 7 is the jackpot: its achievement value, or struck (shown as "x").
         jpv = spec["jackpot"]
         achieved = _snap(raw[r][6] or 0, {jpv, STRIKE}) == jpv
-        out[r][6] = jpv if achieved else ""
+        out[r][6] = jpv if achieved else STRIKE_DISPLAY
         out[r][7] = _points(spec, entries, score, achieved)  # col 8 (derived)
 
-    # I8 is a read point value; keep it (used by the J8 grand total).
-    i8 = raw[_idx("I", 8)[0]][_idx("I", 8)[1]]
-    out[_idx("I", 8)[0]][_idx("I", 8)[1]] = i8 if i8 is not None else 0
-
     # I6 = sum of the score column over B..H.
-    out[_idx("I", 6)[0]][_idx("I", 6)[1]] = sum(
-        out[ord(row) - ord("A")][5] for row in SCORE_ROWS
-    )
+    i6 = sum(out[ord(row) - ord("A")][5] for row in SCORE_ROWS)
+    out[_idx("I", 6)[0]][_idx("I", 6)[1]] = i6
+
+    # I7 = "-" (the totals row has no jackpot); I8 is DERIVED from I6 by bracket
+    # (total_score_points), not read.
+    out[_idx("I", 7)[0]][_idx("I", 7)[1]] = "-"
+    out[_idx("I", 8)[0]][_idx("I", 8)[1]] = total_score_points(i6)
 
     # J8 = sum of the point column B8..I8.
     out[_idx("J", 8)[0]][_idx("J", 8)[1]] = sum(

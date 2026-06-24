@@ -1,7 +1,9 @@
 from fastapi import FastAPI, File, UploadFile, HTTPException, Form
 from fastapi.middleware.cors import CORSMiddleware
 from datetime import datetime
+import hashlib
 import json
+import re
 try:
     from tflite_runtime.interpreter import Interpreter as tflite
 except ImportError:
@@ -60,7 +62,7 @@ RESULTS_DIR = Path("results")
 RESULTS_DIR.mkdir(exist_ok=True)
 
 # Load the digit/symbol recognizer. If it hasn't been trained/copied yet the
-# server still boots so the frontend can be developed; /predict then 503s.
+# server still boots so the frontend can be developed; /read then 503s.
 MODEL_PATH = "digit-model0622.tflite"  # fine-tuned on real Balut cells (finetune.py)
 try:
     interpreter = tflite(model_path=MODEL_PATH)
@@ -71,7 +73,7 @@ try:
 except Exception as e:  # noqa: BLE001 - boot anyway, report at request time
     interpreter = None
     input_details = output_details = None
-    print(f"WARNING: could not load {MODEL_PATH} ({e}). /predict will return 503.")
+    print(f"WARNING: could not load {MODEL_PATH} ({e}). /read will return 503.")
 
 
 def classify(char28):
@@ -591,17 +593,19 @@ def _grid_overlay(table, rb, cb):
     return vis
 
 
-def slice_sheet(image, debug=False):
+def slice_sheet(image, debug=False, out_dir=None):
     """Geometry pipeline: PIL image -> (table, cells, rb, cb, nr, nc).
 
     Deskew -> locate -> dewarp -> trim -> grid-snap -> split into 80 cell crops.
     Shared by read_sheet and the dataset-export tool so both slice cells the same
-    way. With debug=True, writes the numbered stage images to RESULTS_DIR.
+    way. With debug=True, writes the numbered stage images to `out_dir` (the
+    per-result folder), falling back to RESULTS_DIR.
     """
+    dst = Path(out_dir) if out_dir is not None else RESULTS_DIR
     rgb = np.array(image.convert("RGB"))
     gray = cv2.cvtColor(rgb, cv2.COLOR_RGB2GRAY)
     if debug:
-        cv2.imwrite(str(RESULTS_DIR / "1-original.png"), gray)
+        cv2.imwrite(str(dst / "1-original.png"), gray)
 
     # Deskew the whole frame before locating/slicing the table.
     angle = detect_skew(gray)
@@ -613,17 +617,17 @@ def slice_sheet(image, debug=False):
     gray = rotate(gray, angle)
     if debug:
         print(f"Deskew angle: {angle:+.2f}°")
-        cv2.imwrite(str(RESULTS_DIR / "2-deskew.png"), gray)
+        cv2.imwrite(str(dst / "2-deskew.png"), gray)
 
     table = locate_table(gray)                      # rough contour crop
     if debug:
-        cv2.imwrite(str(RESULTS_DIR / "3-crop.png"), table)
+        cv2.imwrite(str(dst / "3-crop.png"), table)
     table = dewarp(table)                           # flatten page curvature first
     if debug:
-        cv2.imwrite(str(RESULTS_DIR / "4-dewarp.png"), table)
+        cv2.imwrite(str(dst / "4-dewarp.png"), table)
     table = _trim_to_gridlines(table)               # then trim to grid extent
     if debug:
-        cv2.imwrite(str(RESULTS_DIR / "5-trim.png"), table)
+        cv2.imwrite(str(dst / "5-trim.png"), table)
 
     rb, cb, nr, nc = grid_boundaries(table)
     cells = split_cells(table, rb, cb)
@@ -631,18 +635,18 @@ def slice_sheet(image, debug=False):
         ok = nr == ROWS + 1 and nc == COLS + 1
         print(f"Grid rules: rows {nr}/{ROWS + 1}, cols {nc}/{COLS + 1}"
               f"{'' if ok else '  (even-split fallback where the count mismatched)'}")
-        cv2.imwrite(str(RESULTS_DIR / "6-grid.png"), _grid_overlay(table, rb, cb))
+        cv2.imwrite(str(dst / "6-grid.png"), _grid_overlay(table, rb, cb))
     return table, cells, rb, cb, nr, nc
 
 
-def read_sheet(image):
+def read_sheet(image, out_dir=None):
     """Full pipeline: PIL image -> corrected 10x8 grid.
 
     Only handwritten cells are recognized; printed labels, blank cells and the
     computed sums are filled in by the scorecard schema (see scorecard.py), so
     the printed text and graphics on the sheet are never read as digits.
     """
-    _, cells, _, _, _, _ = slice_sheet(image, debug=DEBUG_CROPS)
+    _, cells, _, _, _, _ = slice_sheet(image, debug=DEBUG_CROPS, out_dir=out_dir)
     raw = [[None] * COLS for _ in range(ROWS)]
     if USE_CTC:
         try:
@@ -676,17 +680,43 @@ def format_grid(grid):
     return "\n".join(lines)
 
 
-@app.post("/predict")
-async def predict(file: UploadFile = File(...)):
+# Each read gets its own results/ subfolder named YYYYMMDD-xxxxxx, where xxxxxx is
+# 6 lowercase hex chars (like a short git SHA). All artifacts for that read --
+# input image, debug stages, scorecard CSV, the verdict, and any feedback -- live
+# together there.
+RESULT_ID_RE = re.compile(r"^\d{8}-[0-9a-f]{6}$")
+
+
+def _new_result_id():
+    return f"{datetime.now():%Y%m%d}-{hashlib.sha256(os.urandom(16)).hexdigest()[:6]}"
+
+
+def _result_dir(result_id):
+    """Resolve a client-supplied result id to its results/ folder, validating the
+    pattern first so a crafted id can't escape RESULTS_DIR (path traversal)."""
+    if not RESULT_ID_RE.fullmatch(result_id or ""):
+        raise HTTPException(status_code=400, detail="Invalid result id.")
+    d = RESULTS_DIR / result_id
+    if not d.is_dir():
+        raise HTTPException(status_code=404, detail="Unknown result id.")
+    return d
+
+
+@app.post("/read")
+async def read(file: UploadFile = File(...)):
     if interpreter is None:
         raise HTTPException(
             status_code=503,
             detail=f"Model {MODEL_PATH} not loaded. Train it in abi-models and copy it here.",
         )
+    result_id = _new_result_id()
+    out_dir = RESULTS_DIR / result_id
+    out_dir.mkdir(parents=True, exist_ok=True)
     try:
         contents = await file.read()
+        (out_dir / "input.jpg").write_bytes(contents)  # keep the original for ground truth
         image = Image.open(io.BytesIO(contents))
-        grid, warnings = read_sheet(image)
+        grid, warnings = read_sheet(image, out_dir=out_dir)
     except ScanError as e:
         raise HTTPException(status_code=422, detail=str(e))
     except Exception as e:
@@ -706,35 +736,55 @@ async def predict(file: UploadFile = File(...)):
             print(f"  - {w}")
 
     csv = "\n".join(",".join(str(v) for v in row) for row in grid) + "\n"
-    saved_as = RESULTS_DIR / "7-scorecard.csv"  # overwritten each scan
-    saved_as.write_text(csv)
-    print(f"Saved {saved_as}")
+    (out_dir / "7-scorecard.csv").write_text(csv)
+    print(f"Saved {out_dir}")
 
-    return {"grid": grid, "csv": csv, "saved_as": str(saved_as), "warnings": warnings}
+    # Which cells the correction UI lets the player edit (handwritten cells; this
+    # includes I8, which we derive rather than read but is still hand-written).
+    editable = [[scorecard.is_editable(r, c) for c in range(COLS)] for r in range(ROWS)]
+    return {
+        "id": result_id,
+        "grid": grid,
+        "editable": editable,
+        "csv": csv,
+        "saved_as": str(out_dir),
+        "warnings": warnings,
+    }
+
+
+@app.post("/accept")
+async def accept(id: str = Form(...)):
+    """Record a thumbs-up on a read."""
+    (_result_dir(id) / "verdict.md").write_text("accepted\n")
+    return {"ok": True}
+
+
+@app.post("/decline")
+async def decline(id: str = Form(...)):
+    """Record a thumbs-down on a read."""
+    (_result_dir(id) / "verdict.md").write_text("declined\n")
+    return {"ok": True}
 
 
 @app.post("/feedback")
-async def feedback(file: UploadFile = File(...), grid: str = Form(...)):
+async def feedback(id: str = Form(...), grid: str = Form(...)):
     """Store a user-corrected scorecard as ground truth.
 
-    The frontend sends the original image plus the player-corrected 10x8 grid
-    (JSON). We save both under results/feedback/<timestamp>/ so they can later be
-    folded into the training set (the corrected grid is the label for the image).
+    Saved as 8-feedback.csv in the read's own results/<id>/ folder (which also
+    holds input.jpg), so the image and the corrected labels stay together for
+    folding into the training set later.
     """
+    out = _result_dir(id)
     try:
         rows = json.loads(grid)
     except (ValueError, TypeError):
         raise HTTPException(status_code=400, detail="`grid` must be a JSON array.")
-
-    out = RESULTS_DIR / "feedback" / datetime.now().strftime("%Y%m%d-%H%M%S-%f")
-    out.mkdir(parents=True, exist_ok=True)
-    (out / "image.jpg").write_bytes(await file.read())
     csv = "\n".join(
         ",".join("" if v is None else str(v) for v in row) for row in rows
     ) + "\n"
-    (out / "grid.csv").write_text(csv)
-    print(f"Saved corrected scorecard (ground truth) to {out}")
-    return {"ok": True, "saved_as": str(out)}
+    (out / "8-feedback.csv").write_text(csv)
+    print(f"Saved corrected scorecard (ground truth) to {out / '8-feedback.csv'}")
+    return {"ok": True, "saved_as": str(out / "8-feedback.csv")}
 
 
 if __name__ == "__main__":
