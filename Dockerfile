@@ -12,8 +12,8 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
 COPY requirements.txt requirements.txt
 RUN pip install --no-cache-dir -r requirements.txt
 
-# Copy application files (server imports scorecard + trocr_reader)
-COPY digit-model0622.tflite server.py scorecard.py trocr_reader.py .
+# Copy application files (server imports scorecard + trocr_reader + ctc_reader)
+COPY digit-model0622.tflite server.py scorecard.py trocr_reader.py ctc_reader.py .
 
 # Run the server
 CMD [ "python", "server.py" ]

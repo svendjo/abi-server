@@ -93,6 +93,10 @@ Test it.
   -H "Content-Type: multipart/form-data" \
   -F "file=@/path/to/sheet.jpg"`
 
+## Deployment to AWS
+See **[DEPLOY.md](DEPLOY.md)** for the full end-to-end guide (backend → ECR + App
+Runner, frontend → S3 + CloudFront). The quick backend steps:
+
 ## Docker
 Build a Docker image.
 
@@ -103,11 +107,11 @@ Run the Docker container locally. Remember to expose the port.
 `docker run -p 8080:8080 balut-docker:latest`
 
 ## Tag and push it to AWS ECR
-`aws ecr get-login-password --region us-west-2 | docker login --username AWS --password-stdin <account>.dkr.ecr.us-west-2.amazonaws.com`
+`aws ecr get-login-password --region us-west-2 | docker login --username AWS --password-stdin 021891586863.dkr.ecr.us-west-2.amazonaws.com`
 
-`docker tag balut-docker:latest <account>.dkr.ecr.us-west-2.amazonaws.com/balut-repository:latest`
+`docker tag balut-docker:latest 021891586863.dkr.ecr.us-west-2.amazonaws.com/balut-repository:latest`
 
-`docker push <account>.dkr.ecr.us-west-2.amazonaws.com/balut-repository:latest`
+`docker push 021891586863.dkr.ecr.us-west-2.amazonaws.com/balut-repository:latest`
 
 ## Deploy AWS App Runner
 Go to AWS App Runner and deploy balut-repository:latest.
