@@ -15,11 +15,11 @@ Only handwritten / value-bearing cells are exported (printed labels and the
 always-empty cells are skipped, via `scorecard.needs_recognition`).
 
 Usage:
-    python export_cells.py --image dataset/3.jpg --truth results/manual-scorecard.csv
-    python export_cells.py --image dataset/3.jpg --truth results/manual-scorecard.csv \
-                           --sheet 3 --out dataset/cells
+    python export_cells.py --image ../abi-dataset/images/3.jpg --truth results/manual-scorecard.csv
+    python export_cells.py --image ../abi-dataset/images/3.jpg --truth results/manual-scorecard.csv \
+                           --sheet 3 --out ../abi-dataset/cells
 
-Run it once per (photo, ground-truth) pair to build up dataset/cells/.
+Run it once per (photo, ground-truth) pair to build up ../abi-dataset/cells/.
 """
 
 import argparse
@@ -87,7 +87,7 @@ def main():
                     help="manual ground-truth CSV (10x8 grid, A-J rows)")
     ap.add_argument("--sheet", default=None,
                     help="sheet id used in filenames/labels (default: image stem)")
-    ap.add_argument("--out", default="dataset/cells", help="output dir")
+    ap.add_argument("--out", default="../abi-dataset/cells", help="output dir")
     args = ap.parse_args()
 
     image_path = Path(args.image)

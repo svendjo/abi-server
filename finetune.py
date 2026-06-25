@@ -44,7 +44,7 @@ tf.random.set_seed(SEED)
 NUM_CLASSES = 11
 STRIKE_CLASS = 10
 BASE_MODEL = "../abi-models/digit-model.keras"
-DATASET = "dataset/cells"
+DATASET = "../abi-dataset/cells"
 
 
 # --- 1. Build the real character dataset from labeled cells ------------------

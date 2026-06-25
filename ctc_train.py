@@ -38,7 +38,7 @@ import server  # for the CNN baseline comparison
 SEED = 42
 np.random.seed(SEED); tf.random.set_seed(SEED); keras.utils.set_random_seed(SEED)
 
-DATASET = "dataset/cells"
+DATASET = "../abi-dataset/cells"
 IMG_H, IMG_W = 32, 128
 BLANK = 11            # CTC mask index; 0-9 digits, 10 = '-'
 NUM_CLASSES = 12      # 0-9, '-', blank
