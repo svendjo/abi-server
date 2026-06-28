@@ -100,10 +100,11 @@ def main():
     image = Image.open(image_path)
 
     # Same slicing the server uses, so crops line up with what gets recognized.
-    _, cells, _, _, nr, nc = server.slice_sheet(image, debug=False)
-    if (nr, nc) != (ROWS + 1, COLS + 1):
-        print(f"WARNING: grid detected {nr}/{ROWS + 1} rows, {nc}/{COLS + 1} cols "
-              f"(even-split fallback in play); crops may be misaligned.", file=sys.stderr)
+    _, cells, _, _, rows_aligned, cols_aligned = server.slice_sheet(image, debug=False)
+    if not (rows_aligned and cols_aligned):
+        print(f"WARNING: grid not aligned to schema (rows={rows_aligned}, "
+              f"cols={cols_aligned}); even-split fallback in play, crops may be "
+              f"misaligned.", file=sys.stderr)
 
     labels_path = out_dir / "labels.csv"
     new_file = not labels_path.exists()

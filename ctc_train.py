@@ -3,8 +3,8 @@
 Instead of splitting a cell into characters and reading each (the old, brittle
 pipeline whose blob-count-vs-digit-count mismatches capped accuracy), this reads
 the whole cell image straight to its digit string in one shot. CTC handles the
-variable length, so "42", "8", "432" and "-4" are all just sequences; a strike /
-empty cell is the empty string -> value 0.
+variable length, so "42", "8", "432" and "-4" are all just sequences; a struck
+cell is the explicit "x" token (x / - / empty all -> value 0).
 
 Because there's no segmentation filter, it trains on ALL labeled cells (not just
 the cleanly-segmented ones). With only 5 sheets it will overfit those hands and
@@ -40,9 +40,9 @@ np.random.seed(SEED); tf.random.set_seed(SEED); keras.utils.set_random_seed(SEED
 
 DATASET = "../abi-dataset/cells"
 IMG_H, IMG_W = 32, 128
-BLANK = 11            # CTC mask index; 0-9 digits, 10 = '-'
-NUM_CLASSES = 12      # 0-9, '-', blank
-CHARS = "0123456789-"
+BLANK = 12            # CTC mask index; 0-9 digits, 10 = '-', 11 = 'x' (strike)
+NUM_CLASSES = 13      # 0-9, '-', 'x', blank
+CHARS = "0123456789-x"
 
 
 # --- data --------------------------------------------------------------------
@@ -61,8 +61,8 @@ def preprocess_cell(gray):
 
 
 def target_string(value, is_blank):
-    """Cell label -> digit string. Strike/empty -> '' (value 0)."""
-    return "" if is_blank else str(value)
+    """Cell label -> digit string. Struck cell -> 'x' (value 0)."""
+    return "x" if is_blank else str(value)
 
 
 def load_cells():
@@ -160,7 +160,7 @@ def decode_logits(logits):
 
 def to_value(s):
     try:
-        return int(s) if s not in ("", "-") else 0
+        return 0 if s in ("", "-", "x") else int(s)   # x/-/empty -> strike == 0
     except ValueError:
         return 0
 

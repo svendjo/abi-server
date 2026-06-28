@@ -12,7 +12,7 @@ except ImportError:
     # does not trigger the lazy loader and fails on TF 2.16.
     import tensorflow as tf
     tflite = tf.lite.Interpreter
-from PIL import Image
+from PIL import Image, ImageOps
 from pathlib import Path
 import numpy as np
 import cv2
@@ -345,20 +345,51 @@ def _complete_boundaries(pos, extent):
     return pos
 
 
-def grid_boundaries(table):
-    """Return (row_bounds, col_bounds, n_rows_found, n_cols_found).
+def _schema_rows(rraw):
+    """Map detected horizontal rules to the schema's ROWS+1 row boundaries (A..J),
+    keyed on the card variant's rule count, or None if the count is unrecognized.
 
-    Uses the detected printed rules (with missing edge borders filled in) when
-    their count matches the schema exactly (ROWS+1 horizontal, COLS+1 vertical);
-    otherwise falls back to an even split for that axis. Detected bounds handle
-    the uneven label/Points columns.
+      ROWS+1 (11) rules -- America's Cup / QUITOBAL: the rows are already A..J.
+      ROWS+2 (12) rules -- IBF Chicago: an extra Name/UBN/Date row sits on top of
+          the grid; drop it so the next rule down (the Score/Jackpot/Points header)
+          becomes row A.
+      ROWS   (10) rules -- BUNABAL: there is no gridded header row (the
+          Score/Jackpot/Points labels are a separate box above the grid) and an
+          ID/1st-4th legend row sits at the bottom. Synthesize a one-row-tall
+          header band (A) above '4's; B..H and Total then line up, and the bottom
+          legend row lands in J (which carries only the grand-total cell).
+    """
+    n = len(rraw)
+    if n == ROWS + 1:
+        return list(rraw)
+    if n == ROWS + 2:
+        return list(rraw[1:])
+    if n == ROWS:
+        row_h = rraw[1] - rraw[0]
+        return [max(0, rraw[0] - row_h)] + list(rraw)
+    return None
+
+
+def grid_boundaries(table):
+    """Return (row_bounds, col_bounds, rows_aligned, cols_aligned).
+
+    Maps the detected printed rules (with missing edge borders filled in) onto the
+    schema's ROWS+1 x COLS+1 boundaries, handling the three card variants by their
+    rule count (see _schema_rows). Falls back to an even split for an axis whose
+    rule count is unrecognized; the *_aligned boolean is True when that axis was
+    snapped to real rules, False when it was guessed by even split.
     """
     h, w = table.shape
     rraw = _complete_boundaries(_line_positions(table, 0), h)
     craw = _complete_boundaries(_line_positions(table, 1), w)
-    rb = rraw if len(rraw) == ROWS + 1 else [round(i * h / ROWS) for i in range(ROWS + 1)]
-    cb = craw if len(craw) == COLS + 1 else [round(i * w / COLS) for i in range(COLS + 1)]
-    return rb, cb, len(rraw), len(craw)
+    rb = _schema_rows(rraw)
+    cb = list(craw) if len(craw) == COLS + 1 else None
+    rows_aligned, cols_aligned = rb is not None, cb is not None
+    if rb is None:
+        rb = [round(i * h / ROWS) for i in range(ROWS + 1)]
+    if cb is None:
+        cb = [round(i * w / COLS) for i in range(COLS + 1)]
+    return rb, cb, rows_aligned, cols_aligned
 
 
 def split_cells(table, rb, cb):
@@ -594,7 +625,7 @@ def _grid_overlay(table, rb, cb):
 
 
 def slice_sheet(image, debug=False, out_dir=None):
-    """Geometry pipeline: PIL image -> (table, cells, rb, cb, nr, nc).
+    """Geometry pipeline: PIL image -> (table, cells, rb, cb, rows_aligned, cols_aligned).
 
     Deskew -> locate -> dewarp -> trim -> grid-snap -> split into 80 cell crops.
     Shared by read_sheet and the dataset-export tool so both slice cells the same
@@ -602,6 +633,7 @@ def slice_sheet(image, debug=False, out_dir=None):
     per-result folder), falling back to RESULTS_DIR.
     """
     dst = Path(out_dir) if out_dir is not None else RESULTS_DIR
+    image = ImageOps.exif_transpose(image)  # honor EXIF orientation (e.g. rotated phone photos)
     rgb = np.array(image.convert("RGB"))
     gray = cv2.cvtColor(rgb, cv2.COLOR_RGB2GRAY)
     if debug:
@@ -629,14 +661,14 @@ def slice_sheet(image, debug=False, out_dir=None):
     if debug:
         cv2.imwrite(str(dst / "5-trim.png"), table)
 
-    rb, cb, nr, nc = grid_boundaries(table)
+    rb, cb, rows_aligned, cols_aligned = grid_boundaries(table)
     cells = split_cells(table, rb, cb)
     if debug:
-        ok = nr == ROWS + 1 and nc == COLS + 1
-        print(f"Grid rules: rows {nr}/{ROWS + 1}, cols {nc}/{COLS + 1}"
-              f"{'' if ok else '  (even-split fallback where the count mismatched)'}")
+        aligned = rows_aligned and cols_aligned
+        print(f"Grid aligned to schema: rows={rows_aligned} cols={cols_aligned}"
+              f"{'' if aligned else '  (even-split fallback on the unaligned axis)'}")
         cv2.imwrite(str(dst / "6-grid.png"), _grid_overlay(table, rb, cb))
-    return table, cells, rb, cb, nr, nc
+    return table, cells, rb, cb, rows_aligned, cols_aligned
 
 
 def read_sheet(image, out_dir=None):
