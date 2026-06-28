@@ -19,30 +19,34 @@ import cv2
 import io
 import os
 
+import config
+import results_store
 import scorecard
 import trocr_reader
 import ctc_reader
 
+print(f"Environment: APP_ENV={config.APP_ENV}")
 app = FastAPI()
 
-# Cell recognizer selection (the segment+classify CNN is the default):
-#   USE_CTC=1   -> segmentation-free whole-cell CTC reader (cell-reader*.keras)
-#   USE_TROCR=1 -> local TrOCR handwriting model
-# Each falls back to the CNN if its model/deps aren't available.
-USE_CTC = bool(os.environ.get("USE_CTC")) and ctc_reader.available()
-if os.environ.get("USE_CTC") and not USE_CTC:
-    print("WARNING: USE_CTC set but no cell-reader model found; using the CNN.")
+# Cell recognizer selection comes from config/<APP_ENV>.yaml (the segment+classify
+# CNN is the default; each alternative falls back to the CNN if its model/deps
+# aren't available):
+#   use_ctc   -> segmentation-free whole-cell CTC reader (cell-reader*.tflite)
+#   use_trocr -> local TrOCR handwriting model
+USE_CTC = config.USE_CTC and ctc_reader.available()
+if config.USE_CTC and not USE_CTC:
+    print("WARNING: use_ctc set but no cell-reader model found; using the CNN.")
 elif USE_CTC:
     print("Using the segmentation-free CTC reader for cell recognition.")
 
-USE_TROCR = bool(os.environ.get("USE_TROCR")) and trocr_reader.available()
-if os.environ.get("USE_TROCR") and not USE_TROCR:
-    print("WARNING: USE_TROCR set but torch/transformers not available; using the CNN.")
+USE_TROCR = config.USE_TROCR and trocr_reader.available()
+if config.USE_TROCR and not USE_TROCR:
+    print("WARNING: use_trocr set but torch/transformers not available; using the CNN.")
 elif USE_TROCR:
     print("Using TrOCR for cell recognition.")
 
-# Save the located table and a grid overlay to results/ to debug slicing.
-DEBUG_CROPS = bool(os.environ.get("DEBUG_CROPS"))
+# Save the numbered slice stages into each result folder to debug slicing.
+DEBUG_CROPS = config.DEBUG_CROPS
 
 # Configure CORS
 app.add_middleware(
@@ -57,9 +61,14 @@ app.add_middleware(
 ROWS, COLS = 10, 8
 STRIKE_CLASS = 10  # classes 0-9 are digits; 10 means a struck cell (/, \, x) -> value 0
 
-# Where finished CSVs are written.
+# Fallback dir for slice_sheet's debug images when it's called standalone
+# (out_dir=None); real reads write through STORE below.
 RESULTS_DIR = Path("results")
 RESULTS_DIR.mkdir(exist_ok=True)
+
+# Per-environment results storage (local dir or S3 bucket; see config + results_store).
+STORE = results_store.make_store(config.RESULTS)
+print(f"Results store: {config.RESULTS.get('backend', 'local')}")
 
 # Load the digit/symbol recognizer. If it hasn't been trained/copied yet the
 # server still boots so the frontend can be developed; /read then 503s.
@@ -723,15 +732,14 @@ def _new_result_id():
     return f"{datetime.now():%Y%m%d}-{hashlib.sha256(os.urandom(16)).hexdigest()[:6]}"
 
 
-def _result_dir(result_id):
-    """Resolve a client-supplied result id to its results/ folder, validating the
-    pattern first so a crafted id can't escape RESULTS_DIR (path traversal)."""
+def _valid_id(result_id):
+    """Validate a client-supplied result id and confirm the read exists in the store.
+    The regex guards against path-traversal / crafted storage keys."""
     if not RESULT_ID_RE.fullmatch(result_id or ""):
         raise HTTPException(status_code=400, detail="Invalid result id.")
-    d = RESULTS_DIR / result_id
-    if not d.is_dir():
+    if not STORE.exists(result_id):
         raise HTTPException(status_code=404, detail="Unknown result id.")
-    return d
+    return result_id
 
 
 @app.post("/read")
@@ -742,59 +750,68 @@ async def read(file: UploadFile = File(...)):
             detail=f"Model {MODEL_PATH} not loaded. Train it in abi-models and copy it here.",
         )
     result_id = _new_result_id()
-    out_dir = RESULTS_DIR / result_id
-    out_dir.mkdir(parents=True, exist_ok=True)
+    out_dir = STORE.new_working_dir(result_id)  # local dir, or a temp dir staged for S3
     try:
         contents = await file.read()
         (out_dir / "input.jpg").write_bytes(contents)  # keep the original for ground truth
         image = Image.open(io.BytesIO(contents))
         grid, warnings = read_sheet(image, out_dir=out_dir)
+
+        # Always log what was read.
+        print("Scorecard read:")
+        print(format_grid(grid))
+
+        # The sheet's own written Score/Points totals are read independently and
+        # cross-checked against what we compute from the cells. A disagreement is a
+        # hint that something was misread, but it's advisory only: we log it and
+        # proceed with the computed (best-effort) value rather than rejecting the sheet.
+        if warnings:
+            print("Cross-check warnings (proceeding with computed values):")
+            for w in warnings:
+                print(f"  - {w}")
+
+        csv = "\n".join(",".join(str(v) for v in row) for row in grid) + "\n"
+        (out_dir / "7-scorecard.csv").write_text(csv)
+
+        # Which cells the correction UI lets the player edit (handwritten cells;
+        # this includes I8, which we derive rather than read but is still written).
+        editable = [[scorecard.is_editable(r, c) for c in range(COLS)] for r in range(ROWS)]
+        saved_as = STORE.describe(result_id)
+        response = {
+            "id": result_id,
+            "grid": grid,
+            "editable": editable,
+            "csv": csv,
+            "saved_as": saved_as,
+            "warnings": warnings,
+        }
     except ScanError as e:
         raise HTTPException(status_code=422, detail=str(e))
     except Exception as e:
         raise HTTPException(status_code=500, detail=str(e))
+    finally:
+        # Persist whatever was written (even a failed scan's input/debug images, for
+        # later inspection); best-effort so a storage hiccup doesn't mask the result.
+        try:
+            STORE.commit(result_id, out_dir)
+        except Exception as e:
+            print(f"WARNING: failed to persist {result_id}: {e}")
 
-    # Always log what was read.
-    print("Scorecard read:")
-    print(format_grid(grid))
-
-    # The sheet's own written Score/Points totals are read independently and
-    # cross-checked against what we compute from the cells. A disagreement is a
-    # hint that something was misread, but it's advisory only: we log it and
-    # proceed with the computed (best-effort) value rather than rejecting the sheet.
-    if warnings:
-        print("Cross-check warnings (proceeding with computed values):")
-        for w in warnings:
-            print(f"  - {w}")
-
-    csv = "\n".join(",".join(str(v) for v in row) for row in grid) + "\n"
-    (out_dir / "7-scorecard.csv").write_text(csv)
-    print(f"Saved {out_dir}")
-
-    # Which cells the correction UI lets the player edit (handwritten cells; this
-    # includes I8, which we derive rather than read but is still hand-written).
-    editable = [[scorecard.is_editable(r, c) for c in range(COLS)] for r in range(ROWS)]
-    return {
-        "id": result_id,
-        "grid": grid,
-        "editable": editable,
-        "csv": csv,
-        "saved_as": str(out_dir),
-        "warnings": warnings,
-    }
+    print(f"Saved {saved_as}")
+    return response
 
 
 @app.post("/accept")
 async def accept(id: str = Form(...)):
     """Record a thumbs-up on a read."""
-    (_result_dir(id) / "verdict.md").write_text("accepted\n")
+    STORE.put_text(_valid_id(id), "verdict.md", "accepted\n")
     return {"ok": True}
 
 
 @app.post("/decline")
 async def decline(id: str = Form(...)):
     """Record a thumbs-down on a read."""
-    (_result_dir(id) / "verdict.md").write_text("declined\n")
+    STORE.put_text(_valid_id(id), "verdict.md", "declined\n")
     return {"ok": True}
 
 
@@ -802,11 +819,11 @@ async def decline(id: str = Form(...)):
 async def feedback(id: str = Form(...), grid: str = Form(...)):
     """Store a user-corrected scorecard as ground truth.
 
-    Saved as 8-feedback.csv in the read's own results/<id>/ folder (which also
-    holds input.jpg), so the image and the corrected labels stay together for
-    folding into the training set later.
+    Saved as 8-feedback.csv in the read's own <id>/ folder (which also holds
+    input.jpg), so the image and the corrected labels stay together for folding
+    into the training set later.
     """
-    out = _result_dir(id)
+    rid = _valid_id(id)
     try:
         rows = json.loads(grid)
     except (ValueError, TypeError):
@@ -814,16 +831,16 @@ async def feedback(id: str = Form(...), grid: str = Form(...)):
     csv = "\n".join(
         ",".join("" if v is None else str(v) for v in row) for row in rows
     ) + "\n"
-    (out / "8-feedback.csv").write_text(csv)
-    print(f"Saved corrected scorecard (ground truth) to {out / '8-feedback.csv'}")
-    return {"ok": True, "saved_as": str(out / "8-feedback.csv")}
+    STORE.put_text(rid, "8-feedback.csv", csv)
+    saved_as = STORE.describe(rid, "8-feedback.csv")
+    print(f"Saved corrected scorecard (ground truth) to {saved_as}")
+    return {"ok": True, "saved_as": saved_as}
 
 
 if __name__ == "__main__":
     import uvicorn
 
-    # RELOAD=1 auto-restarts the server when a .py file changes (dev only).
-    # Reload requires the import-string form ("server:app") rather than the app
-    # object, and the `watchfiles` package (pip install watchfiles).
-    reload = bool(os.environ.get("RELOAD"))
-    uvicorn.run("server:app", host="0.0.0.0", port=8080, reload=reload)
+    # `reload: true` (local-dev.yaml) auto-restarts the server when a .py file
+    # changes. Reload requires the import-string form ("server:app") rather than the
+    # app object, and the `watchfiles` package (pip install watchfiles).
+    uvicorn.run("server:app", host="0.0.0.0", port=8080, reload=config.RELOAD)

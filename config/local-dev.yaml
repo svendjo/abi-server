@@ -1,0 +1,10 @@
+# Local development environment. Selected by APP_ENV=local-dev (the default),
+# so `python server.py` runs with these settings.
+reload: true          # uvicorn auto-restart on .py changes (needs `watchfiles`)
+use_ctc: true         # segmentation-free whole-cell CTC reader (else the digit CNN)
+use_trocr: false
+debug_crops: true     # write the numbered slice stages into each result folder
+
+results:
+  backend: local      # results/<id>/ on local disk
+  dir: results

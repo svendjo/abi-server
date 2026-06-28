@@ -1,0 +1,11 @@
+# AWS production environment. Selected by APP_ENV=aws-prod (set in the Dockerfile),
+# so the container's `python server.py` runs with these settings.
+reload: false
+use_ctc: true
+use_trocr: false
+debug_crops: true     # debug stages are uploaded to S3 as well
+
+results:
+  backend: s3         # s3://balut-results/<id>/
+  bucket: balut-results
+  region: us-west-2

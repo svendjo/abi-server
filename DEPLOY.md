@@ -77,12 +77,34 @@ aws apprunner start-deployment --region us-west-2 \
   --service-arn <balut-backend-service-arn>
 ```
 
-> ⚠️ **Ephemeral storage caveat.** abi-server writes `results/<id>/` (input image,
-> CSV, `verdict.md`, `8-feedback.csv`) to the container's local disk, which on App
-> Runner is **wiped on every restart/redeploy**. So thumbs-up/down verdicts and the
-> corrected-scorecard ground truth collected in production are **not durable**. To
-> actually keep them, write those to S3 (or a DB) instead of the local `results/`
-> folder — a worthwhile follow-up before relying on prod feedback.
+### A6. Environments & results storage (S3)
+
+abi-server selects an environment from `config/<APP_ENV>.yaml` (`config.py`); the YAML
+carries the run flags (`use_ctc`, `debug_crops`, `reload`) and the results backend, so
+the run command stays just `python server.py`.
+
+| `APP_ENV`              | results backend                  | set by |
+|------------------------|----------------------------------|--------|
+| `local-dev` (default)  | `results/<id>/` on local disk    | nothing — it's the default |
+| `aws-prod`             | `s3://balut-results/<id>/`        | `ENV APP_ENV=aws-prod` in the Dockerfile |
+
+S3 is required in prod: App Runner's local disk is **wiped on every restart/redeploy**
+and **not shared across instances**, so `/accept`, `/decline` and `/feedback` (which
+arrive as separate requests) would otherwise not find the read. Writing to S3 makes the
+input images, verdicts and corrected-scorecard ground truth durable and shared.
+
+**One-time AWS setup (already provisioned):**
+- S3 bucket **`balut-results`** (us-west-2, all public access blocked).
+- IAM role **`BalutAppRunnerInstanceRole`** — inline policy `BalutResultsS3`:
+  `s3:PutObject`/`s3:GetObject` on `arn:aws:s3:::balut-results/*` and `s3:ListBucket`
+  on the bucket.
+
+**Attach the instance role to the service** (one time; this is a *different* role from
+the ECR access role in A4). Console → App Runner → `balut-backend` → **Configuration →
+Edit → Security → Instance role** → `BalutAppRunnerInstanceRole` → Save (redeploys).
+The console is recommended over `aws apprunner update-service` so you don't have to
+re-specify CPU/memory. **Until the instance role is attached, prod reads will 500 on the
+S3 write** (the container has no AWS credentials).
 
 ---
 
