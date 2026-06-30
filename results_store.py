@@ -1,5 +1,5 @@
 """Per-environment storage for each read's artifacts (input.jpg, the numbered debug
-slice stages, 7-scorecard.csv, verdict.md, 8-feedback.csv).
+slice stages, 8-scorecard.csv, verdict.md, 9-feedback.csv).
 
 Backend is chosen from config/<APP_ENV>.yaml (`results.backend`):
   local -> results/<id>/...        on local disk

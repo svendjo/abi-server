@@ -3,6 +3,7 @@ fastapi==0.115.6
 numpy==1.26.4
 opencv-python-headless==4.10.0.84
 pillow==11.1.0
+pytesseract==0.3.13
 python-multipart==0.0.20
 PyYAML==6.0.2
 tflite-runtime==2.14.0

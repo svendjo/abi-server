@@ -12,12 +12,17 @@ except ImportError:
     # does not trigger the lazy loader and fails on TF 2.16.
     import tensorflow as tf
     tflite = tf.lite.Interpreter
-from PIL import Image, ImageOps
+from PIL import Image
 from pathlib import Path
 import numpy as np
 import cv2
 import io
 import os
+
+try:
+    import pytesseract  # orientation detection (OSD); see orient_upright()
+except ImportError:
+    pytesseract = None
 
 import config
 import results_store
@@ -97,10 +102,41 @@ def classify(char28):
 
 
 MAX_SKEW_DEG = 20.0  # refuse to read a sheet rotated more than this
+OSD_MIN_CONF = 1.0   # below this, OSD's orientation guess is unreliable -> trust the frame
 
 
 class ScanError(Exception):
     """The sheet can't be read (e.g. rotated too far); surfaced as a 422."""
+
+
+def orient_upright(gray):
+    """Rotate `gray` to upright using Tesseract OSD (orientation detection).
+
+    A phone photo of a flat card carries an EXIF tag describing how the phone was
+    held, which says nothing about how the card faces on the table -- honoring it
+    rotates landscape shots sideways. So we ignore EXIF and read the orientation
+    from the card's printed text instead. OSD resolves all four 90-degree
+    orientations (aspect ratio can't tell CW from CCW). Returns
+    (rotated_gray, degrees_rotated_cw). Falls back to the frame unchanged if OSD
+    is unavailable, errors, or reports low confidence -- never makes things worse.
+    """
+    if pytesseract is None:
+        return gray, 0
+    try:
+        osd = pytesseract.image_to_osd(gray, output_type=pytesseract.Output.DICT)
+    except Exception as e:  # tesseract not installed, or too few characters to decide
+        print(f"OSD unavailable ({e}); assuming the frame is already upright.")
+        return gray, 0
+    rotate_cw = int(osd.get("rotate", 0)) % 360
+    conf = float(osd.get("orientation_conf", 0.0))
+    ops = {
+        90: cv2.ROTATE_90_CLOCKWISE,
+        180: cv2.ROTATE_180,
+        270: cv2.ROTATE_90_COUNTERCLOCKWISE,
+    }
+    if conf < OSD_MIN_CONF or rotate_cw not in ops:
+        return gray, 0
+    return cv2.rotate(gray, ops[rotate_cw]), rotate_cw
 
 
 def detect_skew(gray):
@@ -622,6 +658,23 @@ def _read_cells_trocr(cells, raw):
         raw[r][c] = scorecard._snap(value, cands) if cands else value
 
 
+DEBUG_SCALE = 0.1  # debug stage PNGs are saved at 1/10 linear size (~1/100 the pixels)
+
+
+def _save_stage(dst, name, img):
+    """Write a downscaled copy of a pipeline stage for debugging.
+
+    The pipeline runs on full-res images; only these inspection PNGs are shrunk
+    (to ~1/100 the pixels) to keep each result folder small.
+    """
+    h, w = img.shape[:2]
+    small = cv2.resize(
+        img, (max(1, round(w * DEBUG_SCALE)), max(1, round(h * DEBUG_SCALE))),
+        interpolation=cv2.INTER_AREA,
+    )
+    cv2.imwrite(str(Path(dst) / name), small)
+
+
 def _grid_overlay(table, rb, cb):
     """Return a BGR copy of `table` with the row/col boundaries drawn in red."""
     h, w = table.shape
@@ -636,17 +689,24 @@ def _grid_overlay(table, rb, cb):
 def slice_sheet(image, debug=False, out_dir=None):
     """Geometry pipeline: PIL image -> (table, cells, rb, cb, rows_aligned, cols_aligned).
 
-    Deskew -> locate -> dewarp -> trim -> grid-snap -> split into 80 cell crops.
-    Shared by read_sheet and the dataset-export tool so both slice cells the same
-    way. With debug=True, writes the numbered stage images to `out_dir` (the
+    Orient -> deskew -> locate -> dewarp -> trim -> grid-snap -> split into 80 cell
+    crops. Shared by read_sheet and the dataset-export tool so both slice cells the
+    same way. With debug=True, writes the numbered stage images to `out_dir` (the
     per-result folder), falling back to RESULTS_DIR.
     """
     dst = Path(out_dir) if out_dir is not None else RESULTS_DIR
-    image = ImageOps.exif_transpose(image)  # honor EXIF orientation (e.g. rotated phone photos)
+    # Ignore EXIF: it records how the phone was held, not how the card faces (see
+    # orient_upright). Read the raw sensor pixels and orient from the printed text.
     rgb = np.array(image.convert("RGB"))
     gray = cv2.cvtColor(rgb, cv2.COLOR_RGB2GRAY)
     if debug:
-        cv2.imwrite(str(dst / "1-original.png"), gray)
+        _save_stage(dst, "1-original.png", gray)
+
+    # Orient the card upright (90-degree steps) before deskew, which only tolerates ±20°.
+    gray, osd_deg = orient_upright(gray)
+    if debug:
+        print(f"OSD rotation: {osd_deg:+d}° CW")
+        _save_stage(dst, "2-oriented.png", gray)
 
     # Deskew the whole frame before locating/slicing the table.
     angle = detect_skew(gray)
@@ -658,17 +718,17 @@ def slice_sheet(image, debug=False, out_dir=None):
     gray = rotate(gray, angle)
     if debug:
         print(f"Deskew angle: {angle:+.2f}°")
-        cv2.imwrite(str(dst / "2-deskew.png"), gray)
+        _save_stage(dst, "3-deskew.png", gray)
 
     table = locate_table(gray)                      # rough contour crop
     if debug:
-        cv2.imwrite(str(dst / "3-crop.png"), table)
+        _save_stage(dst, "4-crop.png", table)
     table = dewarp(table)                           # flatten page curvature first
     if debug:
-        cv2.imwrite(str(dst / "4-dewarp.png"), table)
+        _save_stage(dst, "5-dewarp.png", table)
     table = _trim_to_gridlines(table)               # then trim to grid extent
     if debug:
-        cv2.imwrite(str(dst / "5-trim.png"), table)
+        _save_stage(dst, "6-trim.png", table)
 
     rb, cb, rows_aligned, cols_aligned = grid_boundaries(table)
     cells = split_cells(table, rb, cb)
@@ -676,7 +736,7 @@ def slice_sheet(image, debug=False, out_dir=None):
         aligned = rows_aligned and cols_aligned
         print(f"Grid aligned to schema: rows={rows_aligned} cols={cols_aligned}"
               f"{'' if aligned else '  (even-split fallback on the unaligned axis)'}")
-        cv2.imwrite(str(dst / "6-grid.png"), _grid_overlay(table, rb, cb))
+        _save_stage(dst, "7-grid.png", _grid_overlay(table, rb, cb))
     return table, cells, rb, cb, rows_aligned, cols_aligned
 
 
@@ -771,7 +831,7 @@ async def read(file: UploadFile = File(...)):
                 print(f"  - {w}")
 
         csv = "\n".join(",".join(str(v) for v in row) for row in grid) + "\n"
-        (out_dir / "7-scorecard.csv").write_text(csv)
+        (out_dir / "8-scorecard.csv").write_text(csv)
 
         # Which cells the correction UI lets the player edit (handwritten cells;
         # this includes I8, which we derive rather than read but is still written).
@@ -819,7 +879,7 @@ async def decline(id: str = Form(...)):
 async def feedback(id: str = Form(...), grid: str = Form(...)):
     """Store a user-corrected scorecard as ground truth.
 
-    Saved as 8-feedback.csv in the read's own <id>/ folder (which also holds
+    Saved as 9-feedback.csv in the read's own <id>/ folder (which also holds
     input.jpg), so the image and the corrected labels stay together for folding
     into the training set later.
     """
@@ -831,8 +891,8 @@ async def feedback(id: str = Form(...), grid: str = Form(...)):
     csv = "\n".join(
         ",".join("" if v is None else str(v) for v in row) for row in rows
     ) + "\n"
-    STORE.put_text(rid, "8-feedback.csv", csv)
-    saved_as = STORE.describe(rid, "8-feedback.csv")
+    STORE.put_text(rid, "9-feedback.csv", csv)
+    saved_as = STORE.describe(rid, "9-feedback.csv")
     print(f"Saved corrected scorecard (ground truth) to {saved_as}")
     return {"ok": True, "saved_as": saved_as}
 

@@ -3,9 +3,11 @@ FROM python:3.11-slim
 
 WORKDIR /app
 
-# OpenCV (headless) still needs a couple of shared libs at runtime
+# OpenCV (headless) needs a couple of shared libs at runtime; tesseract-ocr +
+# its osd data back pytesseract's orientation detection (orient_upright).
 RUN apt-get update && apt-get install -y --no-install-recommends \
     libglib2.0-0 libgl1 \
+    tesseract-ocr tesseract-ocr-osd \
     && rm -rf /var/lib/apt/lists/*
 
 # Install dependencies
