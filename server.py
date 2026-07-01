@@ -765,9 +765,7 @@ def read_sheet(image, out_dir=None):
             _read_cells_cnn(cells, raw)
     else:
         _read_cells_cnn(cells, raw)
-    grid = scorecard.apply_schema(raw)
-    warnings = scorecard.check_consistency(raw, grid)
-    return grid, warnings
+    return scorecard.build(raw)  # apply schema + cross-check (shared with /verify)
 
 
 def format_grid(grid):
@@ -802,6 +800,16 @@ def _valid_id(result_id):
     return result_id
 
 
+def _warning_payload(warnings):
+    """Split structured warnings (from scorecard.check_consistency) into the two
+    response fields: `warnings` (human-readable messages) and `warning_cells`
+    (the flat list of [r, c] cells to highlight in the UI)."""
+    return {
+        "warnings": [w["message"] for w in warnings],
+        "warning_cells": [cell for w in warnings for cell in w["cells"]],
+    }
+
+
 @app.post("/read")
 async def read(file: UploadFile = File(...)):
     if interpreter is None:
@@ -821,14 +829,13 @@ async def read(file: UploadFile = File(...)):
         print("Scorecard read:")
         print(format_grid(grid))
 
-        # The sheet's own written Score/Points totals are read independently and
-        # cross-checked against what we compute from the cells. A disagreement is a
-        # hint that something was misread, but it's advisory only: we log it and
-        # proceed with the computed (best-effort) value rather than rejecting the sheet.
+        # The grid shows the player's read Score/Points totals; those reads are
+        # cross-checked against the schema-computed values and any disagreement is
+        # flagged (advisory only -- the sheet is not rejected).
         if warnings:
-            print("Cross-check warnings (proceeding with computed values):")
+            print("Cross-check warnings (read totals disagree with computed):")
             for w in warnings:
-                print(f"  - {w}")
+                print(f"  - {w['message']}")
 
         csv = "\n".join(",".join(str(v) for v in row) for row in grid) + "\n"
         (out_dir / "8-scorecard.csv").write_text(csv)
@@ -843,7 +850,7 @@ async def read(file: UploadFile = File(...)):
             "editable": editable,
             "csv": csv,
             "saved_as": saved_as,
-            "warnings": warnings,
+            **_warning_payload(warnings),
         }
     except ScanError as e:
         raise HTTPException(status_code=422, detail=str(e))
@@ -895,6 +902,27 @@ async def feedback(id: str = Form(...), grid: str = Form(...)):
     saved_as = STORE.describe(rid, "9-feedback.csv")
     print(f"Saved corrected scorecard (ground truth) to {saved_as}")
     return {"ok": True, "saved_as": saved_as}
+
+
+@app.post("/verify")
+async def verify(grid: str = Form(...)):
+    """Cross-check a submitted grid and return any consistency warnings.
+
+    Takes the same JSON 10x8 grid payload as /feedback, but instead of storing it,
+    rebuilds the raw reading and runs the shared schema cross-check (scorecard.build,
+    the same path /read uses). Returns the human-readable warnings -- empty if the
+    written scores/points/totals all agree with what the schema computes.
+    """
+    try:
+        rows = json.loads(grid)
+    except (ValueError, TypeError):
+        raise HTTPException(status_code=400, detail="`grid` must be a JSON array.")
+    if (not isinstance(rows, list) or len(rows) != ROWS
+            or any(not isinstance(row, list) or len(row) != COLS for row in rows)):
+        raise HTTPException(status_code=400, detail=f"`grid` must be a {ROWS}x{COLS} array.")
+    raw = scorecard.raw_from_grid(rows)
+    _, warnings = scorecard.build(raw)
+    return _warning_payload(warnings)
 
 
 if __name__ == "__main__":

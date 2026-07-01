@@ -75,17 +75,19 @@ ROW_SPEC = {
 SCORE_ROWS = list(ROW_SPEC)  # B..H, in order
 
 # Cells whose handwritten value duplicates something the schema computes (each
-# row's Score, and the two grand totals). We read them anyway and cross-check
-# the written number against the computed one to catch misreads.
-CHECK_CELLS = [(row, 6) for row in SCORE_ROWS] + [("I", 6), ("J", 8)]
+# row's Score, the Total Score, its derived points, and the grand total). We read
+# them anyway and cross-check the written number against the computed one to catch
+# misreads.
+CHECK_CELLS = [(row, 6) for row in SCORE_ROWS] + [("I", 6), ("I", 8), ("J", 8)]
 
 
 def needs_recognition(r, c):
     """True iff the (0-based) cell is handwritten and must be read by the model.
 
     Printed labels and always-empty cells are excluded so the server never tries
-    to digit-recognize printed text. The computed sums (col 6, I6, J8) are read
-    too -- not for the output grid, but so check_consistency can cross-check them.
+    to digit-recognize printed text. The computed sums (col 6, I6, I8, J8) are read
+    too -- so the grid can show the player's value and check_consistency can
+    cross-check it against the computed one.
     """
     row, col = chr(ord("A") + r), c + 1
     if (row, col) in LABELS or (row, col) in EMPTY:
@@ -106,13 +108,10 @@ def needs_recognition(r, c):
 def is_editable(r, c):
     """Whether the correction UI lets this (0-based) cell be edited.
 
-    The player's handwritten cells -- i.e. everything `needs_recognition` reads,
-    PLUS I8 (the Total-Score points), which we derive from I6 rather than read but
-    which is still handwritten on the card, so it can be corrected for ground truth.
+    Exactly the player's handwritten cells -- everything `needs_recognition` reads
+    (which now includes I8, the Total-Score points).
     """
-    if needs_recognition(r, c):
-        return True
-    return (chr(ord("A") + r), c + 1) == ("I", 8)
+    return needs_recognition(r, c)
 
 
 def score_candidates(row):
@@ -264,12 +263,18 @@ def apply_schema(raw):
 def check_consistency(raw, grid):
     """Cross-check the player's handwritten totals against the computed ones.
 
-    Returns a list of human-readable WARNING strings (empty if the sheet is
-    self-consistent). The player writes every row Score (col 6) and Points
-    (col 8) plus the two grand totals; we read those independently and flag any
-    that disagree with what the schema computes from the cells. These are
-    advisory only -- the caller logs them and proceeds with the computed value
-    (the best-effort read), it does not reject the sheet.
+    Returns a list of warnings, each a dict {"message": str, "cells": [[r, c], ...]}
+    where `cells` are the 0-based grid cells the warning applies to (empty list if
+    the sheet is self-consistent). The player writes every row Score (col 6) and
+    Points (col 8) plus the two grand totals; we read those independently and flag
+    any that disagree with what the schema computes from the cells. These are
+    advisory only -- the caller surfaces them but does not reject the sheet.
+
+    Cell mapping: a row Score mismatch marks that row's col 6; a row Points
+    mismatch marks that row's cols 7-8 (jackpot + points, which together determine
+    it) -- except Balut (H), which has no jackpot, so only H8 is marked; a Total
+    Score mismatch marks I6; its points mismatch marks I8; a Grand Total mismatch
+    marks J8.
     """
     warnings = []
 
@@ -281,25 +286,113 @@ def check_consistency(raw, grid):
     for row in SCORE_ROWS:
         wr6 = written(row, 6)
         if wr6 is not None and wr6 != computed(row, 6):
-            warnings.append(
-                f"Row {row}: read score {wr6} != computed {computed(row, 6)}; using computed."
-            )
+            warnings.append({
+                "message": f"Row {row}: read score {wr6} != computed {computed(row, 6)}.",
+                "cells": [list(_idx(row, 6))],
+            })
         wr8 = written(row, 8)
         if wr8 is not None and wr8 != computed(row, 8):
-            warnings.append(
-                f"Row {row}: read points {wr8} != computed {computed(row, 8)}; using computed."
-            )
+            # Balut (H) has no jackpot, so its points warning marks only H8, not H7.
+            cells = ([list(_idx(row, 8))] if ROW_SPEC[row]["jackpot"] is None
+                     else [list(_idx(row, 7)), list(_idx(row, 8))])
+            warnings.append({
+                "message": f"Row {row}: read points {wr8} != computed {computed(row, 8)}.",
+                "cells": cells,
+            })
 
     wr_i6 = written("I", 6)
     if wr_i6 is not None and wr_i6 != computed("I", 6):
-        warnings.append(
-            f"Total Score (I6): read {wr_i6} != computed {computed('I', 6)}; using computed."
-        )
+        warnings.append({
+            "message": f"Total Score (I6): read {wr_i6} != computed {computed('I', 6)}.",
+            "cells": [list(_idx("I", 6))],
+        })
+
+    wr_i8 = written("I", 8)
+    if wr_i8 is not None and wr_i8 != computed("I", 8):
+        warnings.append({
+            "message": f"Total Score points (I8): read {wr_i8} != computed {computed('I', 8)}.",
+            "cells": [list(_idx("I", 8))],
+        })
 
     wr_j8 = written("J", 8)
     if wr_j8 is not None and wr_j8 != computed("J", 8):
-        warnings.append(
-            f"Grand Total points (J8): read {wr_j8} != computed {computed('J', 8)}; using computed."
-        )
+        warnings.append({
+            "message": f"Grand Total points (J8): read {wr_j8} != computed {computed('J', 8)}.",
+            "cells": [list(_idx("J", 8))],
+        })
 
     return warnings
+
+
+def _apply_read_totals(raw, computed):
+    """Display grid = the computed grid, but with the Score (col 6) and Points
+    (col 8) columns showing the player's *read* values where we have them.
+
+    We read those columns (rows B-H, plus Total Score I6 and Grand Total J8), so
+    the sheet shows what the player actually wrote rather than our recomputation;
+    the computed grid still drives the cross-check warnings. Cells we don't read
+    (e.g. I8, which is derived from I6) keep their computed value.
+    """
+    grid = [row[:] for row in computed]
+    read_cells = ([(row, 6) for row in SCORE_ROWS]
+                  + [(row, 8) for row in SCORE_ROWS]
+                  + [("I", 6), ("I", 8), ("J", 8)])
+    for row, col in read_cells:
+        r, c = _idx(row, col)
+        if raw[r][c] is not None:
+            grid[r][c] = raw[r][c]
+    return grid
+
+
+def build(raw):
+    """Correct a raw 10x8 reading into the final grid and cross-check it.
+
+    Returns (grid, warnings). This is the single entry point shared by /read
+    (whose `raw` comes from the model) and /verify (whose `raw` is rebuilt from a
+    submitted grid via raw_from_grid), so both produce warnings the same way. The
+    returned grid shows the player's read Score/Points totals (see
+    _apply_read_totals); the separately-computed grid is what those reads are
+    cross-checked against.
+    """
+    computed = apply_schema(raw)
+    warnings = check_consistency(raw, computed)
+    grid = _apply_read_totals(raw, computed)
+    return grid, warnings
+
+
+def _to_raw_value(v):
+    """Map one display-grid cell back to a raw model-style reading.
+
+    Inverts the output encoding: "x"/"X" -> STRIKE, a blank or "-" -> None, a
+    number (or numeric string) -> int. Anything else (e.g. a printed label) -> None.
+    """
+    if isinstance(v, bool):  # JSON true/false is not a reading (bool is an int subclass)
+        return None
+    if isinstance(v, (int, float)):
+        return int(v)
+    if isinstance(v, str):
+        s = v.strip()
+        if s in (STRIKE_DISPLAY, "X"):
+            return STRIKE
+        if s in ("", "-"):
+            return None
+        try:
+            return int(s)
+        except ValueError:
+            return None
+    return None
+
+
+def raw_from_grid(grid):
+    """Rebuild a raw reading from a submitted display grid, for build()/verify.
+
+    Reads only the handwritten cells (those `needs_recognition` covers, which
+    includes the written scores/points/totals check_consistency cross-checks);
+    every other cell stays None. Expects a 10x8 grid (see the /verify guard).
+    """
+    raw = [[None] * COLS for _ in range(ROWS)]
+    for r in range(ROWS):
+        for c in range(COLS):
+            if needs_recognition(r, c):
+                raw[r][c] = _to_raw_value(grid[r][c])
+    return raw
